@@ -6,8 +6,7 @@ from flask_cors import CORS
 app = Flask(__name__)
 CORS(app)  # Permite que tu web en Netlify se comunique con este servidor
 
-# Base de datos simulada en memoria (Guarda el alias y sus ventas totales)
-# Ejemplo: {"progamer99": {"ventas": 3}}
+# Base de datos simulada en memoria[cite: 1]
 afiliados_db = {}
 
 def calcular_descuento_y_nivel(ventas):
