@@ -4,13 +4,13 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 
 app = Flask(__name__)
-CORS(app)  # Permite que tu web en Netlify se comunique con este servidor
+CORS(app)  # Permite la conexión con tu web en Netlify
 
-# Base de datos simulada en memoria
+# Base de datos simulada en memoria con cuentas: { "alias": {"password": "...", "ventas": 0} }
 afiliados_db = {}
 
 def calcular_descuento_y_nivel(ventas):
-    """Calcula el nivel de descuento según la cantidad de referidos."""
+    """Calcula el nivel de descuento según la cantidad de ventas."""
     if ventas >= 18:
         return {"descuentoActual": 50, "faltantesParaSiguiente": 0}  # Nivel Máximo (50%)
     elif ventas >= 8:
@@ -21,33 +21,60 @@ def calcular_descuento_y_nivel(ventas):
         return {"descuentoActual": 20, "faltantesParaSiguiente": 3 - ventas}  # Nivel Bronce (20%)
 
 
-@app.route("/api/crear-afiliado", methods=["POST"])
-def crear_afiliado():
-    data = request.get_json()
+@app.route("/api/registro", methods=["POST"])
+def registro():
+    data = request.get_json() or {}
     nombre = data.get("nombre", "").strip().lower()
+    password = data.get("password", "").strip()
 
-    if not nombre:
-        return jsonify({"error": "El alias no puede estar vacío."}), 400
+    if not nombre or not password:
+        return jsonify({"error": "El alias y la contraseña son obligatorios."}), 400
 
-    if nombre not in afiliados_db:
-        afiliados_db[nombre] = {"ventas": 0}
+    if nombre in afiliados_db:
+        return jsonify({"error": "Ese alias ya está registrado. Por favor, iniciá sesión."}), 400
 
-    ventas_totales = afiliados_db[nombre]["ventas"]
-    info_nivel = calcular_descuento_y_nivel(ventas_totales)
-
-    link = f"/?ref={nombre}"
+    # Crear la cuenta del afiliado
+    afiliados_db[nombre] = {"password": password, "ventas": 0}
     
+    info_nivel = calcular_descuento_y_nivel(0)
     return jsonify({
-        "link": link,
-        "ventas": ventas_totales,
+        "mensaje": "Cuenta creada con éxito",
+        "nombre": nombre,
+        "ventas": 0,
         "descuentoActual": info_nivel["descuentoActual"],
-        "faltantesParaSiguiente": info_nivel["faltantesParaSiguiente"]
+        "faltantesParaSiguiente": info_nivel["faltantesParaSiguiente"],
+        "link": f"/?ref={nombre}"
+    })
+
+
+@app.route("/api/login", methods=["POST"])
+def login():
+    data = request.get_json() or {}
+    nombre = data.get("nombre", "").strip().lower()
+    password = data.get("password", "").strip()
+
+    if not nombre or not password:
+        return jsonify({"error": "Completá todos los campos para iniciar sesión."}), 400
+
+    if nombre not in afiliados_db or afiliados_db[nombre]["password"] != password:
+        return jsonify({"error": "Alias o contraseña incorrectos."}), 401
+
+    ventas = afiliados_db[nombre]["ventas"]
+    info_nivel = calcular_descuento_y_nivel(ventas)
+
+    return jsonify({
+        "mensaje": "Sesión iniciada correctamente",
+        "nombre": nombre,
+        "ventas": ventas,
+        "descuentoActual": info_nivel["descuentoActual"],
+        "faltantesParaSiguiente": info_nivel["faltantesParaSiguiente"],
+        "link": f"/?ref={nombre}"
     })
 
 
 @app.route("/api/verificar-ref/<nombre>", methods=["GET"])
 def verificar_ref(nombre):
-    """Permite consultar el descuento actual de un cupón (para el comprador o el mismo afiliado)."""
+    """Permite consultar el descuento actual de un cupón en la tienda."""
     nombre = nombre.strip().lower()
     if nombre in afiliados_db:
         ventas = afiliados_db[nombre]["ventas"]
