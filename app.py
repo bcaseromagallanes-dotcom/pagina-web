@@ -6,7 +6,7 @@ from flask_cors import CORS
 app = Flask(__name__)
 CORS(app)  # Permite que tu web en Netlify se comunique con este servidor
 
-# Base de datos simulada en memoria[cite: 1]
+# Base de datos simulada en memoria
 afiliados_db = {}
 
 def calcular_descuento_y_nivel(ventas):
@@ -29,7 +29,6 @@ def crear_afiliado():
     if not nombre:
         return jsonify({"error": "El alias no puede estar vacío."}), 400
 
-    # Si el afiliado no existe todavía, lo creamos con 0 ventas
     if nombre not in afiliados_db:
         afiliados_db[nombre] = {"ventas": 0}
 
@@ -46,12 +45,25 @@ def crear_afiliado():
     })
 
 
+@app.route("/api/verificar-ref/<nombre>", methods=["GET"])
+def verificar_ref(nombre):
+    """Permite consultar el descuento actual de un cupón (para el comprador o el mismo afiliado)."""
+    nombre = nombre.strip().lower()
+    if nombre in afiliados_db:
+        ventas = afiliados_db[nombre]["ventas"]
+        info = calcular_descuento_y_nivel(ventas)
+        return jsonify({
+            "valido": True,
+            "descuento": info["descuentoActual"]
+        })
+    return jsonify({"valido": False, "descuento": 0})
+
+
 @app.route("/api/registrar-compra", methods=["POST"])
 def registrar_compra():
     data = request.get_json() or {}
     ref_code = data.get("ref", "").strip().lower()
 
-    # Si el comprador entró con el código de un afiliado válido, le sumamos +1 venta
     if ref_code in afiliados_db:
         afiliados_db[ref_code]["ventas"] += 1
 
