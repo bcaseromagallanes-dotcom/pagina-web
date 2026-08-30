@@ -1,203 +1,646 @@
-import random
-import string
-import time
-import sqlite3
 import os
-from flask import Flask, jsonify, request
+import secrets
+import hashlib
+import re
+import time
+from datetime import datetime, timezone, timedelta
+from functools import wraps
+
+from flask import Flask, jsonify, request, session
 from flask_cors import CORS
+from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
+from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
-CORS(app)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
 
-DB_NAME = os.environ.get("DB_PATH", "database.db")
-ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "ZETA2026ADMIN")
+# -------------------------
+# Configuración segura
+# -------------------------
+IS_PROD = os.environ.get("RENDER", "").lower() == "true" or bool(os.environ.get("RENDER_EXTERNAL_URL"))
+SECRET_KEY = os.environ.get("SECRET_KEY")
+if not SECRET_KEY:
+    SECRET_KEY = secrets.token_urlsafe(48)
+    # En producción esto hace que las sesiones se invaliden al reiniciar.
+    # Configurá SECRET_KEY en Render para que sea persistente.
 
-def query_db(query, args=(), one=False):
-    with sqlite3.connect(DB_NAME) as conn:
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-        cur.execute(query, args)
-        rv = cur.fetchall()
-        conn.commit()
-        return (rv[0] if rv else None) if one else rv
+ADMIN_SECRET = os.environ.get("ADMIN_SECRET")
+if not ADMIN_SECRET and IS_PROD:
+    # No arrancamos en producción con un secreto admin hardcodeado.
+    raise RuntimeError("Falta la variable de entorno ADMIN_SECRET en Render.")
+ADMIN_SECRET = ADMIN_SECRET or secrets.token_urlsafe(32)
 
-def init_db():
-    with sqlite3.connect(DB_NAME) as conn:
-        c = conn.cursor()
-        c.execute('''CREATE TABLE IF NOT EXISTS usuarios (email TEXT PRIMARY KEY, password TEXT, alias TEXT, ventas INTEGER, hwid TEXT, licenciaActivada INTEGER)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS licencias (codigo TEXT PRIMARY KEY, usada INTEGER)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS resenas (id INTEGER PRIMARY KEY AUTOINCREMENT, nombre TEXT, version TEXT, texto TEXT)''')
-        conn.commit()
+DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///database.db")
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = "postgresql+psycopg://" + DATABASE_URL[len("postgres://"):]
+elif DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = "postgresql+psycopg://" + DATABASE_URL[len("postgresql://"):]
 
-init_db()
+FRONTEND_ORIGINS = [x.strip().rstrip("/") for x in os.environ.get("FRONTEND_ORIGINS", "http://localhost:8888,http://localhost:3000").split(",") if x.strip()]
+COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "true" if IS_PROD else "false").lower() == "true"
 
-ip_logs = {}
+app.config.update(
+    SECRET_KEY=SECRET_KEY,
+    SQLALCHEMY_DATABASE_URI=DATABASE_URL,
+    SQLALCHEMY_TRACK_MODIFICATIONS=False,
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SECURE=COOKIE_SECURE,
+    SESSION_COOKIE_SAMESITE="None" if COOKIE_SECURE else "Lax",
+    MAX_CONTENT_LENGTH=1024 * 1024,
+)
 
-def check_rate_limit(ip, max_attempts=5, window=900):
+db = SQLAlchemy(app)
+CORS(
+    app,
+    resources={r"/api/*": {"origins": FRONTEND_ORIGINS}},
+    supports_credentials=True,
+)
+
+# -------------------------
+# Modelos
+# -------------------------
+class User(db.Model):
+    __tablename__ = "usuarios"
+
+    email = db.Column(db.String(255), primary_key=True)
+    password_hash = db.Column(db.String(255), nullable=False)
+    alias = db.Column(db.String(80), unique=True, nullable=False, index=True)
+    ventas = db.Column(db.Integer, nullable=False, default=0)
+    hwid_hash = db.Column(db.String(64), nullable=True)
+    licencia_activada = db.Column(db.Boolean, nullable=False, default=False)
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=lambda: utc_now())
+
+
+class License(db.Model):
+    __tablename__ = "licencias"
+
+    codigo = db.Column(db.String(64), primary_key=True)
+    status = db.Column(db.String(16), nullable=False, default="spare", index=True)  # spare/bound/revoked
+    user_email = db.Column(db.String(255), db.ForeignKey("usuarios.email"), nullable=True, index=True)
+    hwid_hash = db.Column(db.String(64), nullable=True)
+    tier = db.Column(db.String(16), nullable=False, default="PRO")
+    expires_at = db.Column(db.DateTime(timezone=True), nullable=True)
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=lambda: utc_now())
+    bound_at = db.Column(db.DateTime(timezone=True), nullable=True)
+    last_seen_at = db.Column(db.DateTime(timezone=True), nullable=True)
+
+
+class Review(db.Model):
+    __tablename__ = "resenas"
+
+    id = db.Column(db.Integer, primary_key=True)
+    nombre = db.Column(db.String(80), nullable=False)
+    version = db.Column(db.String(40), nullable=True)
+    texto = db.Column(db.String(1000), nullable=False)
+    user_email = db.Column(db.String(255), db.ForeignKey("usuarios.email"), nullable=True, index=True)
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=lambda: utc_now())
+
+
+class CSRFStore(db.Model):
+    __tablename__ = "csrf_tokens"
+
+    user_email = db.Column(db.String(255), primary_key=True)
+    token_hash = db.Column(db.String(64), nullable=False)
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=lambda: utc_now())
+
+
+with app.app_context():
+    db.create_all()
+
+# -------------------------
+# Rate limit básico
+# -------------------------
+RATE_LOGS = {}
+
+
+def client_ip():
+    return request.headers.get("X-Forwarded-For", request.remote_addr or "0.0.0.0").split(",")[0].strip()
+
+
+def rate_limit(bucket, max_attempts=8, window_seconds=600):
     now = time.time()
-    if ip not in ip_logs:
-        ip_logs[ip] = []
-    ip_logs[ip] = [t for t in ip_logs[ip] if now - t < window]
-    if len(ip_logs[ip]) >= max_attempts:
+    key = f"{bucket}:{client_ip()}"
+    events = RATE_LOGS.get(key, [])
+    events = [t for t in events if now - t < window_seconds]
+    if len(events) >= max_attempts:
+        RATE_LOGS[key] = events
         return False
-    ip_logs[ip].append(now)
+    events.append(now)
+    RATE_LOGS[key] = events
     return True
 
-def calcular_descuento_y_nivel(ventas):
-    if ventas >= 18: return {"descuentoActual": 50, "faltantesParaSiguiente": 0}
-    elif ventas >= 8: return {"descuentoActual": 40, "faltantesParaSiguiente": 18 - ventas}
-    elif ventas >= 3: return {"descuentoActual": 30, "faltantesParaSiguiente": 8 - ventas}
-    else: return {"descuentoActual": 20, "faltantesParaSiguiente": 3 - ventas}
 
-@app.route("/", methods=["GET"])
+def hash_hwid(hwid: str) -> str:
+    return hashlib.sha256(hwid.encode("utf-8")).hexdigest()
+
+
+def clean_email(email: str) -> str:
+    return email.strip().lower()
+
+
+def clean_alias(alias: str) -> str:
+    alias = re.sub(r"[^a-zA-Z0-9_-]", "", alias.strip().lower())
+    return alias[:60]
+
+
+def make_alias(email: str) -> str:
+    base = clean_alias(email.split("@", 1)[0]) or "usuario"
+    alias = base
+    n = 2
+    while User.query.filter_by(alias=alias).first() is not None:
+        alias = f"{base}{n}"
+        n += 1
+    return alias
+
+
+def calcular_descuento_y_nivel(ventas: int):
+    if ventas >= 18:
+        return {"descuentoActual": 50, "faltantesParaSiguiente": 0}
+    if ventas >= 8:
+        return {"descuentoActual": 40, "faltantesParaSiguiente": 18 - ventas}
+    if ventas >= 3:
+        return {"descuentoActual": 30, "faltantesParaSiguiente": 8 - ventas}
+    return {"descuentoActual": 20, "faltantesParaSiguiente": 3 - ventas}
+
+
+def user_payload(user: User):
+    nivel = calcular_descuento_y_nivel(user.ventas)
+    active_license = License.query.filter_by(user_email=user.email, status="bound").order_by(License.created_at.desc()).first()
+    expires_at = active_license.expires_at.isoformat() if active_license and active_license.expires_at else None
+    return {
+        "email": user.email,
+        "alias": user.alias,
+        "ventas": user.ventas,
+        "descuentoActual": nivel["descuentoActual"],
+        "faltantesParaSiguiente": nivel["faltantesParaSiguiente"],
+        "link": f"/?ref={user.alias}",
+        "licenciaActivada": bool(user.licencia_activada),
+        "hwidVinculado": bool(user.hwid_hash),
+        "licencia": {
+            "activa": bool(active_license),
+            "tier": active_license.tier if active_license else None,
+            "vence": expires_at,
+            "status": active_license.status if active_license else None,
+        },
+    }
+
+
+def require_auth(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        email = session.get("email")
+        if not email:
+            return jsonify({"error": "Sesión requerida."}), 401
+        user = db.session.get(User, email)
+        if not user:
+            session.clear()
+            return jsonify({"error": "Sesión inválida."}), 401
+        return fn(user, *args, **kwargs)
+    return wrapper
+
+
+def issue_csrf(user_email: str) -> str:
+    token = secrets.token_urlsafe(32)
+    row = db.session.get(CSRFStore, user_email)
+    hashed = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    if row:
+        row.token_hash = hashed
+        row.created_at = utc_now()
+    else:
+        db.session.add(CSRFStore(user_email=user_email, token_hash=hashed))
+    db.session.commit()
+    return token
+
+
+def require_csrf():
+    email = session.get("email")
+    sent = request.headers.get("X-CSRF-Token", "")
+    if not email or not sent:
+        return False
+    row = db.session.get(CSRFStore, email)
+    if not row:
+        return False
+    return secrets.compare_digest(row.token_hash, hashlib.sha256(sent.encode("utf-8")).hexdigest())
+
+
+def require_admin():
+    provided = request.headers.get("X-Admin-Secret", "")
+    return bool(provided) and secrets.compare_digest(provided, ADMIN_SECRET)
+
+
+def utc_now():
+    return datetime.now(timezone.utc)
+
+
+def license_is_valid(lic: License) -> bool:
+    if not lic or lic.status != "bound":
+        return False
+    if lic.expires_at is None:
+        return True
+    expiry = lic.expires_at
+    # SQLite puede devolver datetimes sin tzinfo aunque el modelo use timezone=True.
+    if expiry.tzinfo is None:
+        expiry = expiry.replace(tzinfo=timezone.utc)
+    return expiry > utc_now()
+
+# -------------------------
+# Rutas públicas
+# -------------------------
+@app.get("/")
 def home():
-    return "ZetaBoost API funcionando correctamente!", 200
+    return jsonify({"ok": True, "service": "ZetaBoost API", "version": "2.0"})
 
-@app.route("/api/registro", methods=["POST"])
+
+@app.get("/api/health")
+def health():
+    try:
+        db.session.execute(db.text("SELECT 1"))
+        return jsonify({"ok": True})
+    except Exception:
+        return jsonify({"ok": False}), 503
+
+
+@app.post("/api/registro")
 def registro():
-    client_ip = request.remote_addr or "0.0.0.0"
-    if not check_rate_limit(client_ip, max_attempts=5, window=900):
+    if not rate_limit("registro", max_attempts=5, window_seconds=900):
         return jsonify({"error": "Demasiados intentos. Esperá unos minutos."}), 429
 
-    data = request.get_json() or {}
-    email = data.get("email", "").strip().lower()
-    password = data.get("password", "").strip()
-    confirm_password = data.get("confirmPassword", "").strip()
-    hwid = data.get("hwid", "").strip()
+    data = request.get_json(silent=True) or {}
+    email = clean_email(str(data.get("email", "")))
+    password = str(data.get("password", ""))
+    confirm_password = str(data.get("confirmPassword", ""))
 
     if not email or not password or not confirm_password:
         return jsonify({"error": "Todos los campos son obligatorios."}), 400
-
+    if len(email) > 255 or "@" not in email:
+        return jsonify({"error": "Ingresá un correo válido."}), 400
+    if len(password) < 8 or len(password) > 128:
+        return jsonify({"error": "La contraseña debe tener entre 8 y 128 caracteres."}), 400
     if password != confirm_password:
         return jsonify({"error": "Las contraseñas no coinciden."}), 400
-
-    if query_db("SELECT email FROM usuarios WHERE email = ?", (email,), one=True):
+    if User.query.filter_by(email=email).first():
         return jsonify({"error": "Este correo ya está registrado. Iniciá sesión."}), 400
 
-    alias = email.split('@')[0].replace('.', '')
-    password_hash = generate_password_hash(password)
+    user = User(email=email, password_hash=generate_password_hash(password), alias=make_alias(email), ventas=0)
+    db.session.add(user)
+    try:
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        return jsonify({"error": "No se pudo crear la cuenta. Probá nuevamente."}), 409
 
-    query_db("INSERT INTO usuarios (email, password, alias, ventas, hwid, licenciaActivada) VALUES (?, ?, ?, ?, ?, ?)",
-             (email, password_hash, alias, 0, hwid if hwid else None, 0))
+    session.clear()
+    session["email"] = user.email
+    csrf = issue_csrf(user.email)
+    return jsonify({"mensaje": "Cuenta creada con éxito", "csrfToken": csrf, **user_payload(user)}), 201
 
-    info_nivel = calcular_descuento_y_nivel(0)
-    return jsonify({
-        "mensaje": "Cuenta creada con éxito",
-        "email": email,
-        "alias": alias,
-        "ventas": 0,
-        "descuentoActual": info_nivel["descuentoActual"],
-        "faltantesParaSiguiente": info_nivel["faltantesParaSiguiente"],
-        "link": f"/?ref={alias}",
-        "licenciaActivada": False
-    })
 
-@app.route("/api/login", methods=["POST"])
+@app.post("/api/login")
 def login():
-    client_ip = request.remote_addr or "0.0.0.0"
-    if not check_rate_limit(client_ip, max_attempts=10, window=600):
-        return jsonify({"error": "Demasiados intentos fallidos. IP bloqueada temporalmente."}), 429
+    if not rate_limit("login", max_attempts=10, window_seconds=600):
+        return jsonify({"error": "Demasiados intentos. Probá más tarde."}), 429
 
-    data = request.get_json() or {}
-    email = data.get("email", "").strip().lower()
-    password = data.get("password", "").strip()
-    current_hwid = data.get("hwid", "").strip()
-
+    data = request.get_json(silent=True) or {}
+    email = clean_email(str(data.get("email", "")))
+    password = str(data.get("password", ""))
     if not email or not password:
         return jsonify({"error": "Ingresá tu correo y contraseña."}), 400
 
-    user_data = query_db("SELECT * FROM usuarios WHERE email = ?", (email,), one=True)
-    if not user_data or not check_password_hash(user_data["password"], password):
+    user = db.session.get(User, email)
+    if not user or not check_password_hash(user.password_hash, password):
         return jsonify({"error": "Correo o contraseña incorrectos."}), 401
 
-    if not user_data["hwid"] and current_hwid:
-        query_db("UPDATE usuarios SET hwid = ? WHERE email = ?", (current_hwid, email))
-    elif current_hwid and user_data["hwid"] and user_data["hwid"] != current_hwid:
-        return jsonify({"error": "Dispositivo no reconocido. Cuenta vinculada a otro PC.", "code": "HWID_MISMATCH"}), 403
+    session.clear()
+    session["email"] = user.email
+    csrf = issue_csrf(user.email)
+    return jsonify({"mensaje": "Sesión iniciada correctamente", "csrfToken": csrf, **user_payload(user)})
 
-    ventas = user_data["ventas"]
-    info_nivel = calcular_descuento_y_nivel(ventas)
 
-    return jsonify({
-        "mensaje": "Sesión iniciada correctamente",
-        "email": email,
-        "alias": user_data["alias"],
-        "ventas": ventas,
-        "descuentoActual": info_nivel["descuentoActual"],
-        "faltantesParaSiguiente": info_nivel["faltantesParaSiguiente"],
-        "link": f"/?ref={user_data['alias']}",
-        "licenciaActivada": bool(user_data["licenciaActivada"])
-    })
+@app.post("/api/logout")
+@require_auth
+def logout(user):
+    if not require_csrf():
+        return jsonify({"error": "CSRF inválido."}), 403
+    session.clear()
+    return jsonify({"mensaje": "Sesión cerrada."})
 
-@app.route("/api/verificar-ref/<alias>", methods=["GET"])
-def verificar_ref(alias):
-    alias = alias.strip().lower()
-    user = query_db("SELECT ventas FROM usuarios WHERE alias = ?", (alias,), one=True)
-    if user:
-        info = calcular_descuento_y_nivel(user["ventas"])
-        return jsonify({"valido": True, "descuento": info["descuentoActual"]})
-    return jsonify({"valido": False, "descuento": 0})
 
-@app.route("/api/admin/generar-licencia", methods=["GET"])
-def generar_licencia():
-    secret = request.args.get("secret")
-    if secret != ADMIN_SECRET:
-        return jsonify({"error": "Acceso denegado."}), 403
-
-    letras = string.ascii_uppercase + string.digits
-    licencia = f"ZETA-PRO-{''.join(random.choices(letras, k=4))}-{''.join(random.choices(letras, k=4))}-{''.join(random.choices(letras, k=4))}"
-    
-    query_db("INSERT INTO licencias (codigo, usada) VALUES (?, 0)", (licencia,))
-    return jsonify({"licencia_generada": licencia, "estado": "Lista para usar"})
-
-@app.route("/api/activar-licencia", methods=["POST"])
-def activar_licencia():
-    client_ip = request.remote_addr or "0.0.0.0"
-    if not check_rate_limit(client_ip, max_attempts=5, window=600):
-        return jsonify({"error": "Demasiados intentos. Bloqueo de 10 minutos."}), 429
-
-    data = request.get_json() or {}
-    email = data.get("email", "").strip().lower()
-    licencia = data.get("licencia", "").strip()
-
-    user = query_db("SELECT * FROM usuarios WHERE email = ?", (email,), one=True)
+@app.get("/api/session")
+def current_session():
+    email = session.get("email")
+    if not email:
+        return jsonify({"autenticado": False})
+    user = db.session.get(User, email)
     if not user:
-        return jsonify({"error": "Usuario no encontrado."}), 404
+        session.clear()
+        return jsonify({"autenticado": False})
+    return jsonify({"autenticado": True, **user_payload(user)})
 
-    lic = query_db("SELECT * FROM licencias WHERE codigo = ?", (licencia,), one=True)
+
+@app.get("/api/verificar-ref/<alias>")
+def verificar_ref(alias):
+    alias = clean_alias(alias)
+    user = User.query.filter(func.lower(User.alias) == alias).first()
+    if not user:
+        return jsonify({"valido": False, "descuento": 0})
+    info = calcular_descuento_y_nivel(user.ventas)
+    return jsonify({"valido": True, "descuento": info["descuentoActual"]})
+
+
+@app.get("/api/reseñas")
+def listar_resenas():
+    rows = Review.query.order_by(Review.id.desc()).limit(100).all()
+    return jsonify([
+        {
+            "id": r.id,
+            "nombre": r.nombre,
+            "version": r.version or "",
+            "texto": r.texto,
+            "createdAt": r.created_at.isoformat(),
+        }
+        for r in rows
+    ])
+
+
+@app.post("/api/reseñas")
+@require_auth
+def guardar_resena(user):
+    if not require_csrf():
+        return jsonify({"error": "CSRF inválido."}), 403
+    if not rate_limit("reviews", max_attempts=3, window_seconds=3600):
+        return jsonify({"error": "Demasiadas reseñas. Probá más tarde."}), 429
+
+    # Solo compradores verificados pueden publicar.
+    lic = License.query.filter_by(user_email=user.email, status="bound").first()
+    if not lic or not license_is_valid(lic):
+        return jsonify({"error": "Necesitás una licencia Pro activa para publicar una reseña verificada."}), 403
+
+    data = request.get_json(silent=True) or {}
+    texto = str(data.get("texto", "")).strip()
+    version = str(data.get("version", "")).strip()[:40]
+    if not texto:
+        return jsonify({"error": "El texto es obligatorio."}), 400
+    if len(texto) > 1000:
+        return jsonify({"error": "La reseña no puede superar 1000 caracteres."}), 400
+
+    review = Review(nombre=user.alias, version=version, texto=texto, user_email=user.email)
+    db.session.add(review)
+    db.session.commit()
+    return jsonify({"mensaje": "Reseña publicada con éxito"}), 201
+
+# -------------------------
+# Licencias / anti-compartición
+# -------------------------
+@app.post("/api/activar-licencia")
+@require_auth
+def activar_licencia(user):
+    if not require_csrf():
+        return jsonify({"error": "CSRF inválido."}), 403
+    if not rate_limit("activate", max_attempts=5, window_seconds=600):
+        return jsonify({"error": "Demasiados intentos. Bloqueo temporal."}), 429
+
+    data = request.get_json(silent=True) or {}
+    licencia_codigo = str(data.get("licencia", "")).strip().upper()
+    hwid = str(data.get("hwid", "")).strip()
+    if not licencia_codigo or not hwid:
+        return jsonify({"error": "Licencia y HWID son obligatorios."}), 400
+    if len(hwid) < 8 or len(hwid) > 512:
+        return jsonify({"error": "HWID inválido."}), 400
+
+    hwid_digest = hash_hwid(hwid)
+    lic = License.query.filter_by(codigo=licencia_codigo).with_for_update().first()
     if not lic:
         return jsonify({"error": "Clave de licencia inválida."}), 400
-    if lic["usada"] == 1:
-        return jsonify({"error": "Esta clave ya fue utilizada por otro usuario."}), 400
+    if lic.status == "revoked":
+        return jsonify({"error": "Esta clave fue revocada."}), 400
 
-    query_db("UPDATE licencias SET usada = 1 WHERE codigo = ?", (licencia,))
-    query_db("UPDATE usuarios SET licenciaActivada = 1 WHERE email = ?", (email,))
+    # Una cuenta = un dispositivo. Una licencia = una cuenta + un dispositivo.
+    if user.hwid_hash and not secrets.compare_digest(user.hwid_hash, hwid_digest):
+        return jsonify({
+            "error": "Dispositivo no reconocido. La cuenta ya está vinculada a otro PC.",
+            "code": "HWID_MISMATCH",
+        }), 403
 
-    script_pro = "@echo off\ncls\necho ==================================\necho ZetaBoost Pro V4.5 Elite\necho ==================================\necho Aplicando optimizaciones de kernel...\ntimeout /t 2 >nul\necho Eliminando input lag...\ntimeout /t 2 >nul\necho Sistema optimizado!\npause"
+    if lic.status == "bound":
+        if lic.user_email != user.email or not lic.hwid_hash or not secrets.compare_digest(lic.hwid_hash, hwid_digest):
+            return jsonify({"error": "Esta licencia ya está vinculada a otra cuenta o dispositivo."}), 409
+        return jsonify({"error": "La licencia ya estaba activada en esta cuenta.", **user_payload(user)})
 
+    # Evita que una cuenta tenga múltiples licencias simultáneas por accidente.
+    existing = License.query.filter_by(user_email=user.email, status="bound").first()
+    if existing and license_is_valid(existing):
+        return jsonify({"error": "Tu cuenta ya tiene una licencia Pro activa."}), 409
+
+    now = utc_now()
+    lic.status = "bound"
+    lic.user_email = user.email
+    lic.hwid_hash = hwid_digest
+    lic.bound_at = now
+    lic.last_seen_at = now
+    user.hwid_hash = hwid_digest
+    user.licencia_activada = True
+    db.session.commit()
+
+    # NO enviamos el script .bat desde el servidor. El archivo Pro debe consultar
+    # /api/license/validate antes de ejecutar optimizaciones.
     return jsonify({
-        "exito": True, 
-        "mensaje": "¡Licencia activada con éxito!",
-        "script_pro": script_pro
-    }), 200
+        "exito": True,
+        "mensaje": "¡Licencia activada y vinculada a este dispositivo!",
+        "license": {
+            "tier": lic.tier,
+            "vence": lic.expires_at.isoformat() if lic.expires_at else None,
+            "status": lic.status,
+        },
+        **user_payload(user),
+    })
 
-@app.route("/api/reseñas", methods=["POST", "GET"])
-def reseñas():
-    if request.method == "POST":
-        data = request.get_json() or {}
-        texto = data.get("texto", "").strip()
-        if not texto:
-            return jsonify({"error": "El texto es obligatorio."}), 400
-        
-        nombre = data.get("nombre", "").strip() or "Comprador Anónimo"
-        version = data.get("version", "").strip()
-        
-        query_db("INSERT INTO resenas (nombre, version, texto) VALUES (?, ?, ?)", (nombre, version, texto))
-        return jsonify({"mensaje": "Reseña publicada con éxito"})
-    
-    rows = query_db("SELECT * FROM resenas ORDER BY id DESC")
-    return jsonify([dict(ix) for ix in rows])
+
+@app.post("/api/license/validate")
+@require_auth
+def validate_license(user):
+    if not require_csrf():
+        return jsonify({"valid": False, "error": "CSRF inválido."}), 403
+    data = request.get_json(silent=True) or {}
+    hwid = str(data.get("hwid", "")).strip()
+    if not hwid or not user.hwid_hash:
+        return jsonify({"valid": False, "error": "Dispositivo no vinculado."}), 403
+
+    digest = hash_hwid(hwid)
+    if not secrets.compare_digest(user.hwid_hash, digest):
+        return jsonify({"valid": False, "code": "HWID_MISMATCH", "error": "Dispositivo no autorizado."}), 403
+
+    lic = License.query.filter_by(user_email=user.email, status="bound").order_by(License.created_at.desc()).first()
+    if not lic or not lic.hwid_hash or not secrets.compare_digest(lic.hwid_hash, digest):
+        return jsonify({"valid": False, "error": "Licencia no vinculada a este dispositivo."}), 403
+    if not license_is_valid(lic):
+        return jsonify({"valid": False, "code": "EXPIRED", "error": "La licencia expiró."}), 403
+
+    lic.last_seen_at = utc_now()
+    db.session.commit()
+    return jsonify({
+        "valid": True,
+        "tier": lic.tier,
+        "expiresAt": lic.expires_at.isoformat() if lic.expires_at else None,
+    })
+
+# -------------------------
+# Administración
+# -------------------------
+@app.post("/api/admin/generar-licencia")
+def generar_licencia():
+    if not require_admin():
+        return jsonify({"error": "Acceso denegado."}), 403
+    if not rate_limit("admin-license", max_attempts=20, window_seconds=600):
+        return jsonify({"error": "Demasiadas solicitudes admin."}), 429
+
+    data = request.get_json(silent=True) or {}
+    days = int(data.get("days", 0) or 0)
+    tier = str(data.get("tier", "PRO")).upper().strip()
+    count = min(max(int(data.get("count", 1) or 1), 1), 100)
+    if tier not in {"PRO", "LIFETIME"}:
+        return jsonify({"error": "Tier inválido."}), 400
+    if days < 0 or days > 3650:
+        return jsonify({"error": "days inválido."}), 400
+    if tier == "LIFETIME":
+        days = 0
+
+    created = []
+    for _ in range(count):
+        code = "ZETA-PRO-" + "-".join(secrets.token_hex(3).upper() for _ in range(3))
+        expires_at = utc_now() + timedelta(days=days) if days else None
+        lic = License(codigo=code, tier=tier, expires_at=expires_at)
+        db.session.add(lic)
+        created.append({"codigo": code, "tier": tier, "vence": expires_at.isoformat() if expires_at else None})
+    db.session.commit()
+    return jsonify({"licencias": created}), 201
+
+
+@app.post("/api/admin/ventas")
+def admin_ventas():
+    if not require_admin():
+        return jsonify({"error": "Acceso denegado."}), 403
+    data = request.get_json(silent=True) or {}
+    email = clean_email(str(data.get("email", "")))
+    amount = int(data.get("cantidad", 0) or 0)
+    if not email or amount == 0:
+        return jsonify({"error": "email y cantidad son obligatorios."}), 400
+    user = db.session.get(User, email)
+    if not user:
+        return jsonify({"error": "Usuario no encontrado."}), 404
+    user.ventas = max(0, user.ventas + amount)
+    db.session.commit()
+    return jsonify(user_payload(user))
+
+
+@app.post("/api/admin/revocar-licencia")
+def revocar_licencia():
+    if not require_admin():
+        return jsonify({"error": "Acceso denegado."}), 403
+    data = request.get_json(silent=True) or {}
+    codigo = str(data.get("licencia", "")).strip().upper()
+    lic = License.query.filter_by(codigo=codigo).first()
+    if not lic:
+        return jsonify({"error": "Licencia no encontrada."}), 404
+    lic.status = "revoked"
+    if lic.user_email:
+        user = db.session.get(User, lic.user_email)
+        if user:
+            user.licencia_activada = False
+    db.session.commit()
+    return jsonify({"mensaje": "Licencia revocada."})
+
+
+@app.post("/api/client/validate")
+def client_validate():
+    """Validación para el launcher/cliente Pro.
+
+    No depende de la sesión del navegador: la licencia se prueba contra el HWID
+    que el cliente obtiene en Windows. El servidor nunca recibe el HWID en claro
+    en la base; guarda únicamente SHA-256.
+    """
+    if not rate_limit("client-validate", max_attempts=30, window_seconds=300):
+        return jsonify({"valid": False, "error": "Demasiadas validaciones. Probá más tarde."}), 429
+
+    data = request.get_json(silent=True) or {}
+    codigo = str(data.get("licencia", "")).strip().upper()
+    hwid = str(data.get("hwid", "")).strip()
+    if not codigo or not hwid:
+        return jsonify({"valid": False, "error": "Licencia y HWID son obligatorios."}), 400
+
+    lic = License.query.filter_by(codigo=codigo).first()
+    if not lic or lic.status != "bound" or not lic.hwid_hash:
+        return jsonify({"valid": False, "error": "Licencia no válida o no activada."}), 403
+
+    digest = hash_hwid(hwid)
+    if not secrets.compare_digest(lic.hwid_hash, digest):
+        return jsonify({"valid": False, "code": "HWID_MISMATCH", "error": "Este dispositivo no está autorizado."}), 403
+    if not license_is_valid(lic):
+        return jsonify({"valid": False, "code": "EXPIRED", "error": "La licencia expiró."}), 403
+
+    lic.last_seen_at = utc_now()
+    db.session.commit()
+    return jsonify({
+        "valid": True,
+        "tier": lic.tier,
+        "expiresAt": lic.expires_at.isoformat() if lic.expires_at else None,
+    })
+
+
+@app.post("/api/admin/reset-hwid")
+def admin_reset_hwid():
+    if not require_admin():
+        return jsonify({"error": "Acceso denegado."}), 403
+    data = request.get_json(silent=True) or {}
+    email = clean_email(str(data.get("email", "")))
+    codigo = str(data.get("licencia", "")).strip().upper()
+    lic = License.query.filter_by(codigo=codigo).first() if codigo else None
+    user = db.session.get(User, email) if email else None
+    if not user and not lic:
+        return jsonify({"error": "Indicá email o licencia."}), 400
+    if lic:
+        lic.hwid_hash = None
+        lic.status = "spare"
+        lic.user_email = None
+        lic.bound_at = None
+        lic.last_seen_at = None
+    if user:
+        user.hwid_hash = None
+        user.licencia_activada = False
+        bound = License.query.filter_by(user_email=user.email, status="bound").all()
+        for other in bound:
+            other.status = "spare"
+            other.user_email = None
+            other.hwid_hash = None
+            other.bound_at = None
+            other.last_seen_at = None
+    db.session.commit()
+    return jsonify({"mensaje": "HWID restablecido."})
+
+
+@app.after_request
+def security_headers(response):
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    if COOKIE_SECURE:
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    return response
+
+
+@app.errorhandler(413)
+def too_large(_):
+    return jsonify({"error": "Solicitud demasiado grande."}), 413
+
+
+@app.errorhandler(500)
+def internal_error(_):
+    db.session.rollback()
+    return jsonify({"error": "Error interno del servidor."}), 500
+
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
