@@ -8,9 +8,11 @@ from werkzeug.security import generate_password_hash, check_password_hash
 app = Flask(__name__)
 CORS(app)  # Permite la conexión con tu web en Netlify
 
-# Base de datos simulada en memoria: 
-# { "correo@example.com": {"password": "hash...", "alias": "usuario", "ventas": 0, "hwid": "..."} }
+# Base de datos simulada en memoria para afiliados
 afiliados_db = {}
+
+# Base de datos simulada en memoria para reseñas
+reseñas_db = []
 
 # Control de Rate Limiting por IP en memoria (anti-spam / multicuentas)
 ip_logs = {}
@@ -46,7 +48,6 @@ def calcular_descuento_y_nivel(ventas):
 def registro():
     client_ip = request.remote_addr or "0.0.0.0"
     
-    # Aplicar Rate Limiting al registrarse
     if not check_rate_limit(client_ip, max_attempts=5, window=900):
         return jsonify({"error": "Demasiados intentos de registro desde esta IP. Esperá unos minutos."}), 429
 
@@ -54,7 +55,7 @@ def registro():
     email = data.get("email", "").strip().lower()
     password = data.get("password", "").strip()
     confirm_password = data.get("confirmPassword", "").strip()
-    hwid = data.get("hwid", "").strip() # Recibe el HWID opcional u obligatorio desde el cliente
+    hwid = data.get("hwid", "").strip()
 
     if not email or not password or not confirm_password:
         return jsonify({"error": "Todos los campos son obligatorios."}), 400
@@ -62,17 +63,12 @@ def registro():
     if password != confirm_password:
         return jsonify({"error": "Las contraseñas no coinciden."}), 400
 
-    # 1 cuenta por email (Validación estricta)
     if email in afiliados_db:
         return jsonify({"error": "Este correo ya está registrado. Iniciá sesión."}), 400
 
-    # Generamos un alias automático para el link de referidos
     alias = email.split('@')[0].replace('.', '')
-
-    # Encriptar la contraseña de forma segura (Hash) en lugar de texto plano
     password_hash = generate_password_hash(password)
 
-    # Guardar en la base de datos simulada con soporte para HWID
     afiliados_db[email] = {
         "password": password_hash,
         "alias": alias,
@@ -96,7 +92,6 @@ def registro():
 def login():
     client_ip = request.remote_addr or "0.0.0.0"
     
-    # Aplicar Rate Limiting en el login para evitar ataques de fuerza bruta
     if not check_rate_limit(client_ip, max_attempts=10, window=600):
         return jsonify({"error": "Demasiados intentos fallidos. IP bloqueada temporalmente."}), 429
 
@@ -113,19 +108,15 @@ def login():
 
     user_data = afiliados_db[email]
 
-    # Verificar la contraseña cifrada mediante hash
     if not check_password_hash(user_data["password"], password):
         return jsonify({"error": "Correo o contraseña incorrectos."}), 401
 
-    # Protección Anti-Compartir (Vinculación de Hardware - HWID)
     if not user_data["hwid"]:
-        # Si el usuario aún no tenía HWID registrado, se lo vinculamos en el primer acceso
         if current_hwid:
             user_data["hwid"] = current_hwid
     elif current_hwid and user_data["hwid"] != current_hwid:
-        # Si el HWID actual no coincide con el registrado, se bloquea por intento de compartir cuenta
         return jsonify({
-            "error": "Dispositivo no reconocido. Esta cuenta ya está vinculada a otro ordenador (Protección Anti-Compartir).",
+            "error": "Dispositivo no reconocido. Esta cuenta ya está vinculada a otro ordenador.",
             "code": "HWID_MISMATCH"
         }, 403)
 
@@ -162,7 +153,6 @@ def recuperar_password():
 
 @app.route("/api/verificar-ref/<alias>", methods=["GET"])
 def verificar_ref(alias):
-    """Permite consultar el descuento actual de un cupón mediante su alias."""
     alias = alias.strip().lower()
     for email, data in afiliados_db.items():
         if data["alias"] == alias:
@@ -180,16 +170,14 @@ def registrar_compra():
     data = request.get_json() or {}
     ref_code = data.get("ref", "").strip().lower()
 
-    # Buscar si el código de referido coincide con algún alias
     for email, user_data in afiliados_db.items():
         if user_data["alias"] == ref_code:
             user_data["ventas"] += 1
             break
 
-    # Generar clave de licencia Pro única
     letras = string.ascii_uppercase + string.digits
     b1 = "".join(random.choices(letras, k=4))
-    b2 = "".join(random.choices(letras, k=4))
+    b2 = "".join(random.choices(leters if 'leters' in locals() else letras, k=4)) # corregido
     b3 = "".join(random.choices(letras, k=4))
     licencia = f"ZETA-PRO-{b1}-{b2}-{b3}"
 
@@ -197,6 +185,35 @@ def registrar_compra():
         "licencia": licencia,
         "mensaje": "Compra procesada correctamente y referido contabilizado."
     })
+
+
+@app.route("/api/registrar-resena", methods=["POST"])
+def registrar_resena():
+    data = request.get_json() or {}
+    version = data.get("version", "").strip()
+    nombre = data.get("nombre", "").strip() or "Comprador Anónimo"
+    texto = data.get("texto", "").strip()
+
+    if not texto:
+        return jsonify({"error": "El texto de la reseña es obligatorio."}), 400
+
+    nueva_reseña = {
+        "nombre": nombre,
+        "version": version,
+        "texto": texto
+    }
+
+    reseñas_db.insert(0, nueva_reseña)
+
+    return jsonify({
+        "mensaje": "Reseña publicada con éxito",
+        "reseñas": reseñas_db
+    })
+
+
+@app.route("/api/obtener-reseñas", methods=["GET"])
+def obtener_reseñas():
+    return jsonify(reseñas_db)
 
 
 if __name__ == "__main__":
