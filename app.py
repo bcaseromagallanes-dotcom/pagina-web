@@ -181,7 +181,7 @@ def activar_licencia():
 
     return jsonify({
         "exito": True, 
-        "mensaje": "¡Licencia activada con éxito! Descargando...",
+        "mensaje": "¡Licencia activada con éxito!",
         "script_pro": script_pro
     }), 200
 
@@ -203,4 +203,4 @@ def reseñas():
     return jsonify([dict(ix) for ix in rows])
 
 if __name__ == "__main__":
-    app.run(debug=False, port=5000)
+    app.run(debug=True, port=5000)
