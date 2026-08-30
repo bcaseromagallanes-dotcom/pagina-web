@@ -10,9 +10,8 @@ from werkzeug.security import generate_password_hash, check_password_hash
 app = Flask(__name__)
 CORS(app)
 
-# Base de datos persistente (se crea en la ruta especificada o en el directorio actual)
 DB_NAME = os.environ.get("DB_PATH", "database.db")
-ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "ZETA2026ADMIN") 
+ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "ZETA2026ADMIN")
 
 def query_db(query, args=(), one=False):
     with sqlite3.connect(DB_NAME) as conn:
@@ -142,7 +141,6 @@ def verificar_ref(alias):
 
 @app.route("/api/admin/generar-licencia", methods=["GET"])
 def generar_licencia():
-    """Genera una licencia única para entregar al cliente."""
     secret = request.args.get("secret")
     if secret != ADMIN_SECRET:
         return jsonify({"error": "Acceso denegado."}), 403
@@ -176,7 +174,6 @@ def activar_licencia():
     query_db("UPDATE licencias SET usada = 1 WHERE codigo = ?", (licencia,))
     query_db("UPDATE usuarios SET licenciaActivada = 1 WHERE email = ?", (email,))
 
-    # Script BAT que se va a descargar automáticamente
     script_pro = "@echo off\ncls\necho ==================================\necho ZetaBoost Pro V4.5 Elite\necho ==================================\necho Aplicando optimizaciones de kernel...\ntimeout /t 2 >nul\necho Eliminando input lag...\ntimeout /t 2 >nul\necho Sistema optimizado!\npause"
 
     return jsonify({
