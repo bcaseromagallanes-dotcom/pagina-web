@@ -6,7 +6,7 @@ from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
-CORS(app)  # Permite la conexión con tu web en Netlify
+CORS(app)  # Permite la conexión con tu web
 
 # Base de datos simulada en memoria para afiliados
 afiliados_db = {}
@@ -42,6 +42,11 @@ def calcular_descuento_y_nivel(ventas):
         return {"descuentoActual": 30, "faltantesParaSiguiente": 8 - ventas}
     else:
         return {"descuentoActual": 20, "faltantesParaSiguiente": 3 - ventas}
+
+
+@app.route("/", methods=["GET"])
+def home():
+    return "ZetaBoost API is running successfully!", 200
 
 
 @app.route("/api/registro", methods=["POST"])
@@ -177,7 +182,7 @@ def registrar_compra():
 
     letras = string.ascii_uppercase + string.digits
     b1 = "".join(random.choices(letras, k=4))
-    b2 = "".join(random.choices(leters if 'leters' in locals() else letras, k=4)) # corregido
+    b2 = "".join(random.choices(letras, k=4))  # Corregido de 'leters'
     b3 = "".join(random.choices(letras, k=4))
     licencia = f"ZETA-PRO-{b1}-{b2}-{b3}"
 
@@ -187,7 +192,9 @@ def registrar_compra():
     })
 
 
+# --- RUTAS DE RESEÑAS (Con soporte dual para evitar errores 404) ---
 @app.route("/api/registrar-resena", methods=["POST"])
+@app.route("/api/reseñas", methods=["POST"])
 def registrar_resena():
     data = request.get_json() or {}
     version = data.get("version", "").strip()
@@ -212,6 +219,7 @@ def registrar_resena():
 
 
 @app.route("/api/obtener-reseñas", methods=["GET"])
+@app.route("/api/reseñas", methods=["GET"])
 def obtener_reseñas():
     return jsonify(reseñas_db)
 
