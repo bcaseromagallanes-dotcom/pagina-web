@@ -14,10 +14,10 @@ afiliados_db = {}
 # Base de datos simulada en memoria para reseñas
 reseñas_db = []
 
-# Base de datos simulada de licencias válidas Pro
+# Base de datos simulada de licencias válidas Pro (incluye fijas y las generadas automáticamente)
 licencias_validas = {
-    "ZETA-PRO-9988": True, 
-    "ELITE-FPS-2026": True, 
+    "ZETA-PRO-9988": True,  
+    "ELITE-FPS-2026": True,  
     "VIP-ZETA-2026": True
 }
 
@@ -189,15 +189,25 @@ def registrar_compra():
             user_data["ventas"] += 1
             break
 
+    # Generación automática de la licencia
     letras = string.ascii_uppercase + string.digits
     b1 = "".join(random.choices(letras, k=4))
     b2 = "".join(random.choices(letras, k=4))
     b3 = "".join(random.choices(letras, k=4))
     licencia = f"ZETA-PRO-{b1}-{b2}-{b3}"
 
+    # Guardamos la licencia generada como válida de inmediato
+    licencias_validas[licencia] = True
+
+    # Imprime la clave en los Logs de Render para que la copies y la envíes por WhatsApp
+    print("\n" + "="*50)
+    print(f"🔑 NUEVA LICENCIA GENERADA AUTOMÁTICAMENTE: {licencia}")
+    print(f"👤 Referido acreditado a: {ref_code if ref_code else 'Ninguno (Venta directa)'}")
+    print("="*50 + "\n")
+
     return jsonify({
         "licencia": licencia,
-        "mensaje": "Compra procesada correctamente y referido contabilizado."
+        "mensaje": "Compra procesada correctamente y licencia habilitada."
     })
 
 
