@@ -14,6 +14,13 @@ afiliados_db = {}
 # Base de datos simulada en memoria para reseñas
 reseñas_db = []
 
+# Base de datos simulada de licencias válidas Pro
+licencias_validas = {
+    "ZETA-PRO-9988": True, 
+    "ELITE-FPS-2026": True, 
+    "VIP-ZETA-2026": True
+}
+
 # Control de Rate Limiting por IP en memoria (anti-spam / multicuentas)
 ip_logs = {}
 
@@ -23,7 +30,6 @@ def check_rate_limit(ip, max_attempts=5, window=900):
     if ip not in ip_logs:
         ip_logs[ip] = []
     
-    # Limpiar registros fuera de la ventana de tiempo
     ip_logs[ip] = [t for t in ip_logs[ip] if now - t < window]
     
     if len(ip_logs[ip]) >= max_attempts:
@@ -78,7 +84,8 @@ def registro():
         "password": password_hash,
         "alias": alias,
         "ventas": 0,
-        "hwid": hwid if hwid else None
+        "hwid": hwid if hwid else None,
+        "licenciaActivada": False
     }
 
     info_nivel = calcular_descuento_y_nivel(0)
@@ -89,7 +96,8 @@ def registro():
         "ventas": 0,
         "descuentoActual": info_nivel["descuentoActual"],
         "faltantesParaSiguiente": info_nivel["faltantesParaSiguiente"],
-        "link": f"/?ref={alias}"
+        "link": f"/?ref={alias}",
+        "licenciaActivada": False
     })
 
 
@@ -123,7 +131,7 @@ def login():
         return jsonify({
             "error": "Dispositivo no reconocido. Esta cuenta ya está vinculada a otro ordenador.",
             "code": "HWID_MISMATCH"
-        }, 403)
+        }), 403
 
     ventas = user_data["ventas"]
     info_nivel = calcular_descuento_y_nivel(ventas)
@@ -135,7 +143,8 @@ def login():
         "ventas": ventas,
         "descuentoActual": info_nivel["descuentoActual"],
         "faltantesParaSiguiente": info_nivel["faltantesParaSiguiente"],
-        "link": f"/?ref={user_data['alias']}"
+        "link": f"/?ref={user_data['alias']}",
+        "licenciaActivada": user_data.get("licenciaActivada", False)
     })
 
 
@@ -182,7 +191,7 @@ def registrar_compra():
 
     letras = string.ascii_uppercase + string.digits
     b1 = "".join(random.choices(letras, k=4))
-    b2 = "".join(random.choices(letras, k=4))  # Corregido de 'leters'
+    b2 = "".join(random.choices(letras, k=4))
     b3 = "".join(random.choices(letras, k=4))
     licencia = f"ZETA-PRO-{b1}-{b2}-{b3}"
 
@@ -192,7 +201,36 @@ def registrar_compra():
     })
 
 
-# --- RUTAS DE RESEÑAS (Con soporte dual para evitar errores 404) ---
+@app.route("/api/activar-licencia", methods=["POST"])
+def activar_licencia():
+    data = request.get_json() or {}
+    email = data.get("email", "").strip().lower()
+    licencia = data.get("licencia", "").strip()
+
+    if email not in afiliados_db:
+        return jsonify({"error": "Usuario no encontrado."}), 404
+
+    if licencia in licencias_validas:
+        afiliados_db[email]["licenciaActivada"] = True
+        return jsonify({
+            "exito": True, 
+            "mensaje": "¡Licencia Pro activada con éxito! Ya podés descargar el optimizador avanzado."
+        }), 200
+    
+    return jsonify({"error": "Clave de licencia inválida o expirada."}), 400
+
+
+@app.route("/api/changelog", methods=["GET"])
+def get_changelog():
+    changelog = [
+        {"version": "v4.5", "fecha": "Agosto 2026", "cambios": "Optimización profunda para Windows 11 24H2 y menor consumo de RAM."},
+        {"version": "v4.4", "fecha": "Junio 2026", "cambios": "Nuevo motor de prioridad de interrupciones de CPU por hardware."},
+        {"version": "v4.3", "fecha": "Marzo 2026", "cambios": "Corrección de tirones (stutters) en Fortnite y Warzone."}
+    ]
+    return jsonify(changelog), 200
+
+
+# --- RUTAS DE RESEÑAS (Soporte dual) ---
 @app.route("/api/registrar-resena", methods=["POST"])
 @app.route("/api/reseñas", methods=["POST"])
 def registrar_resena():
